@@ -801,62 +801,19 @@ class TLMigrateInstance(Tasklet):
       - change disks into single-master mode
 
     """
-    # Check for hypervisor version mismatch and warn the user.
-    hvspecs = [(self.instance.hypervisor,
-                self.cfg.GetClusterInfo().hvparams[self.instance.hypervisor])]
-    nodeinfo = self.rpc.call_node_info(
-                 [self.source_node_uuid, self.target_node_uuid], None, hvspecs)
-    for ninfo in nodeinfo.values():
-      ninfo.Raise("Unable to retrieve node information from node '%s'" %
-                  ninfo.node)
-    (_, _, (src_info, )) = nodeinfo[self.source_node_uuid].payload
-    (_, _, (dst_info, )) = nodeinfo[self.target_node_uuid].payload
 
-    if ((constants.HV_NODEINFO_KEY_VERSION in src_info) and
-        (constants.HV_NODEINFO_KEY_VERSION in dst_info)):
-      src_version = src_info[constants.HV_NODEINFO_KEY_VERSION]
-      dst_version = dst_info[constants.HV_NODEINFO_KEY_VERSION]
-      if src_version != dst_version:
-        self.feedback_fn("* warning: hypervisor version mismatch between"
-                         " source (%s) and target (%s) node" %
-                         (src_version, dst_version))
-        hv = hypervisor.GetHypervisorClass(self.instance.hypervisor)
-        if hv.VersionsSafeForMigration(src_version, dst_version):
-          self.feedback_fn("  migrating from hypervisor version %s to %s should"
-                           " be safe" % (src_version, dst_version))
-        else:
-          self.feedback_fn("  migrating from hypervisor version %s to %s is"
-                           " likely unsupported" % (src_version, dst_version))
-          if self.ignore_hvversions:
-            self.feedback_fn("  continuing anyway (told to ignore version"
-                             " mismatch)")
-          else:
-            raise errors.OpExecError("Unsupported migration between hypervisor"
-                                     " versions (%s to %s)" %
-                                     (src_version, dst_version))
-
-    self.feedback_fn("* checking disk consistency between source and target")
-    for (idx, dev) in enumerate(self.cfg.GetInstanceDisks(self.instance.uuid)):
-      if not CheckDiskConsistency(self.lu, self.instance, dev,
+    self._CheckHypervisorVersions(self.instance,
+                                  self.source_node_uuid,
                                   self.target_node_uuid,
-                                  False):
-        raise errors.OpExecError("Disk %s is degraded or not fully"
-                                 " synchronized on target node,"
-                                 " aborting migration" % idx)
+                                  self.ignore_hvversions)
 
-    if self.current_mem > self.tgt_free_mem:
-      if not self.allow_runtime_changes:
-        raise errors.OpExecError("Memory ballooning not allowed and not enough"
-                                 " free memory to fit instance %s on target"
-                                 " node %s (have %dMB, need %dMB)" %
-                                 (self.instance.name,
-                                  self.cfg.GetNodeName(self.target_node_uuid),
-                                  self.tgt_free_mem, self.current_mem))
-      self.feedback_fn("* setting instance memory to %s" % self.tgt_free_mem)
-      rpcres = self.rpc.call_instance_balloon_memory(self.instance.primary_node,
-                                                     self.instance,
-                                                     self.tgt_free_mem)
-      rpcres.Raise("Cannot modify instance runtime memory")
+    self._CheckDiskConsistency(self.instance,
+                               self.target_node_uuid)
+
+    self._UpdateMemorySize(self.instance,
+                           self.target_node_uuid,
+                           self.current_mem,
+                           self.tgt_free_mem)
 
     # First get the migration information from the remote node
     result = self.rpc.call_migration_info(self.source_node_uuid, self.instance)
@@ -869,25 +826,124 @@ class TLMigrateInstance(Tasklet):
 
     self.migration_info = migration_info = result.payload
 
-    disks = self.cfg.GetInstanceDisks(self.instance.uuid)
+    # Then switch the disks to master/master mode
+    self._DisksToMasterMasterMode(self.instance,
+                                  self.source_node_uuid,
+                                  self.target_node_uuid)
 
-    self._CloseInstanceDisks(self.target_node_uuid)
+    self._PrepareTargetToAccept(self.target_node_uuid,
+                                self.instance,
+                                migration_info)
+
+    self._StartMigration(self.instance,
+                         self.target_node_uuid,
+                         self.live)
+
+    self._TransferMemory(self.instance,
+                         self.source_node_uuid)
+
+    self._FinalizeMigration(self.instance,
+                            self.source_node_uuid,
+                            self.target_node_uuid,
+                            migration_info,
+                            self.live)
+
+    # Update instance location only after finalize completed. This way, if
+    # either finalize fails, the config still stores the old primary location,
+    # so we can know which instance to delete if we need to (manually) clean up.
+    self.cfg.SetInstancePrimaryNode(self.instance.uuid, self.target_node_uuid)
+    self.instance = self.cfg.GetInstanceInfo(self.instance_uuid)
+
+    self._UnmapSourceDisks(self.instance,
+                           self.instance_uuid,
+                           self.source_node_uuid,
+                           self.target_node_uuid)
+
+
+    self.feedback_fn("* done")
+
+  def _CheckHypervisorVersions(self, instance, source_node_uuid,
+                               target_node_uuid, ignore_hvversions):
+    hvspecs = [(instance.hypervisor,
+                self.cfg.GetClusterInfo().hvparams[instance.hypervisor])]
+    nodeinfo = self.rpc.call_node_info(
+                 [source_node_uuid, target_node_uuid], None, hvspecs)
+    for ninfo in nodeinfo.values():
+      ninfo.Raise("Unable to retrieve node information from node '%s'" %
+                  ninfo.node)
+    (_, _, (src_info, )) = nodeinfo[source_node_uuid].payload
+    (_, _, (dst_info, )) = nodeinfo[target_node_uuid].payload
+
+    if ((constants.HV_NODEINFO_KEY_VERSION in src_info) and
+        (constants.HV_NODEINFO_KEY_VERSION in dst_info)):
+      src_version = src_info[constants.HV_NODEINFO_KEY_VERSION]
+      dst_version = dst_info[constants.HV_NODEINFO_KEY_VERSION]
+      if src_version != dst_version:
+        self.feedback_fn("* warning: hypervisor version mismatch between"
+                         " source (%s) and target (%s) node" %
+                         (src_version, dst_version))
+        hv = hypervisor.GetHypervisorClass(instance.hypervisor)
+        if hv.VersionsSafeForMigration(src_version, dst_version):
+          self.feedback_fn("  migrating from hypervisor version %s to %s should"
+                           " be safe" % (src_version, dst_version))
+        else:
+          self.feedback_fn("  migrating from hypervisor version %s to %s is"
+                           " likely unsupported" % (src_version, dst_version))
+          if ignore_hvversions:
+            self.feedback_fn("  continuing anyway (told to ignore version"
+                             " mismatch)")
+          else:
+            raise errors.OpExecError("Unsupported migration between hypervisor"
+                                     " versions (%s to %s)" %
+                                     (src_version, dst_version))
+
+  def _CheckDiskConsistency(self, instance, target_node_uuid):
+    self.feedback_fn("* checking disk consistency between source and target")
+    for (idx, dev) in enumerate(self.cfg.GetInstanceDisks(instance.uuid)):
+      if not CheckDiskConsistency(self.lu, instance, dev,
+                                  target_node_uuid,
+                                  False):
+        raise errors.OpExecError("Disk %s is degraded or not fully"
+                                 " synchronized on target node,"
+                                 " aborting migration" % idx)
+
+  def _UpdateMemorySize(self, instance, target_node_uuid,
+                        current_mem, tgt_free_mem):
+    if current_mem > tgt_free_mem:
+      if not self.allow_runtime_changes:
+        raise errors.OpExecError("Memory ballooning not allowed and not enough"
+                                 " free memory to fit instance %s on target"
+                                 " node %s (have %dMB, need %dMB)" %
+                                 (instance.name,
+                                  self.cfg.GetNodeName(target_node_uuid),
+                                  tgt_free_mem, current_mem))
+      self.feedback_fn("* setting instance memory to %s" % tgt_free_mem)
+      rpcres = self.rpc.call_instance_balloon_memory(instance.primary_node,
+                                                     instance,
+                                                     tgt_free_mem)
+      rpcres.Raise("Cannot modify instance runtime memory")
+
+  def _DisksToMasterMasterMode(self, instance,
+                               source_node_uuid, target_node_uuid):
+    disks = self.cfg.GetInstanceDisks(instance.uuid)
+
+    self._CloseInstanceDisks(target_node_uuid)
 
     if utils.AnyDiskOfType(disks, constants.DTS_INT_MIRROR):
-      # Then switch the disks to master/master mode
       self._GoStandalone()
       self._GoReconnect(True)
       self._WaitUntilSync()
 
-    self._OpenInstanceDisks(self.source_node_uuid, False)
-    self._OpenInstanceDisks(self.target_node_uuid, False)
+    self._OpenInstanceDisks(source_node_uuid, False)
+    self._OpenInstanceDisks(target_node_uuid, False)
 
+  def _PrepareTargetToAccept(self, target_node_uuid, instance, migration_info):
     self.feedback_fn("* preparing %s to accept the instance" %
-                     self.cfg.GetNodeName(self.target_node_uuid))
-    result = self.rpc.call_accept_instance(self.target_node_uuid,
-                                           self.instance,
+                     self.cfg.GetNodeName(target_node_uuid))
+    result = self.rpc.call_accept_instance(target_node_uuid,
+                                           instance,
                                            migration_info,
-                                           self.nodes_ip[self.target_node_uuid])
+                                           self.nodes_ip[target_node_uuid])
 
     msg = result.fail_msg
     if msg:
@@ -897,14 +953,15 @@ class TLMigrateInstance(Tasklet):
       self._AbortMigration()
       self._RevertDiskStatus()
       raise errors.OpExecError("Could not pre-migrate instance %s: %s" %
-                               (self.instance.name, msg))
+                               (instance.name, msg))
 
+  def _StartMigration(self, instance, target_node_uuid, live):
     self.feedback_fn("* migrating instance to %s" %
-                     self.cfg.GetNodeName(self.target_node_uuid))
+                     self.cfg.GetNodeName(target_node_uuid))
     cluster = self.cfg.GetClusterInfo()
     result = self.rpc.call_instance_migrate(
-        self.source_node_uuid, cluster.cluster_name, self.instance,
-        self.nodes_ip[self.target_node_uuid], self.live)
+        self.source_node_uuid, cluster.cluster_name, instance,
+        self.nodes_ip[target_node_uuid], live)
     msg = result.fail_msg
     if msg:
       logging.error("Instance migration failed, trying to revert"
@@ -913,17 +970,18 @@ class TLMigrateInstance(Tasklet):
       self._AbortMigration()
       self._RevertDiskStatus()
       raise errors.OpExecError("Could not migrate instance %s: %s" %
-                               (self.instance.name, msg))
+                               (instance.name, msg))
 
+  def _TransferMemory(self, instance, source_node_uuid):
     self.feedback_fn("* starting memory transfer")
     last_feedback = time.time()
 
     migration_caps = \
-      self.instance.hvparams.get(constants.HV_KVM_MIGRATION_CAPS, None)
+      instance.hvparams.get(constants.HV_KVM_MIGRATION_CAPS, None)
     postcopy_enabled = migration_caps and 'postcopy-ram' in migration_caps
     while True:
       result = self.rpc.call_instance_get_migration_status(
-                 self.source_node_uuid, self.instance)
+                 source_node_uuid, instance)
       msg = result.fail_msg
       ms = result.payload   # MigrationStatus instance
       if msg or (ms.status in constants.HV_MIGRATION_FAILED_STATUSES):
@@ -935,16 +993,21 @@ class TLMigrateInstance(Tasklet):
         if not msg:
           msg = "hypervisor returned failure"
         raise errors.OpExecError("Could not migrate instance %s: %s" %
-                                 (self.instance.name, msg))
+                                 (instance.name, msg))
 
       if (postcopy_enabled
           and ms.status == constants.HV_MIGRATION_ACTIVE
           and int(ms.dirty_sync_count) >= self._POSTCOPY_SYNC_COUNT_THRESHOLD):
         self.feedback_fn("* finishing memory transfer with postcopy")
-        self.rpc.call_instance_start_postcopy(self.source_node_uuid,
-                                              self.instance)
+        self.rpc.call_instance_start_postcopy(source_node_uuid, instance)
 
-      if ms.status not in constants.HV_KVM_MIGRATION_ACTIVE_STATUSES:
+      if self.instance.hypervisor == 'kvm':
+        migration_active = \
+          ms.status in constants.HV_KVM_MIGRATION_ACTIVE_STATUSES
+      else:
+        migration_active = \
+          ms.status == constants.HV_MIGRATION_ACTIVE
+      if not migration_active:
         self.feedback_fn("* memory transfer complete")
         break
 
@@ -957,48 +1020,47 @@ class TLMigrateInstance(Tasklet):
 
       time.sleep(self._MIGRATION_POLL_INTERVAL)
 
+  def _FinalizeMigration(self, instance,
+                         source_node_uuid, target_node_uuid,
+                         migration_info, live):
     # Always call finalize on both source and target, they should compose
     # a single operation, consisting of (potentially) parallel steps, that
     # should be always attempted/retried together (like in _AbortMigration)
     # without setting any expecetations in what order they execute.
     result_src = self.rpc.call_instance_finalize_migration_src(
-        self.source_node_uuid, self.instance, True, self.live)
+        source_node_uuid, instance, True, live)
 
     result_dst = self.rpc.call_instance_finalize_migration_dst(
-        self.target_node_uuid, self.instance, migration_info, True)
+        target_node_uuid, instance, migration_info, True)
 
     err_msg = []
     if result_src.fail_msg:
       logging.error("Instance migration succeeded, but finalization failed"
                     " on the source node: %s", result_src.fail_msg)
-      err_msg.append(self.cfg.GetNodeName(self.source_node_uuid) + ': '
+      err_msg.append(self.cfg.GetNodeName(source_node_uuid) + ': '
                      + result_src.fail_msg)
 
     if result_dst.fail_msg:
       logging.error("Instance migration succeeded, but finalization failed"
                     " on the target node: %s", result_dst.fail_msg)
-      err_msg.append(self.cfg.GetNodeName(self.target_node_uuid) + ': '
+      err_msg.append(self.cfg.GetNodeName(target_node_uuid) + ': '
                      + result_dst.fail_msg)
 
     if err_msg:
       raise errors.OpExecError(
           "Could not finalize instance migration: %s" % ' '.join(err_msg))
 
-    # Update instance location only after finalize completed. This way, if
-    # either finalize fails, the config still stores the old primary location,
-    # so we can know which instance to delete if we need to (manually) clean up.
-    self.cfg.SetInstancePrimaryNode(self.instance.uuid, self.target_node_uuid)
-    self.instance = self.cfg.GetInstanceInfo(self.instance_uuid)
-
-    self._CloseInstanceDisks(self.source_node_uuid)
-    disks = self.cfg.GetInstanceDisks(self.instance_uuid)
+  def _UnmapSourceDisks(self, instance, instance_uuid,
+                        source_node_uuid, target_node_uuid):
+    self._CloseInstanceDisks(source_node_uuid)
+    disks = self.cfg.GetInstanceDisks(instance_uuid)
     if utils.AnyDiskOfType(disks, constants.DTS_INT_MIRROR):
       self._WaitUntilSync()
       self._GoStandalone()
       self._GoReconnect(False)
       self._WaitUntilSync()
     elif utils.AnyDiskOfType(disks, constants.DTS_EXT_MIRROR):
-      self._OpenInstanceDisks(self.target_node_uuid, True)
+      self._OpenInstanceDisks(target_node_uuid, True)
 
     # If the instance's disk template is `rbd' or `ext' and there was a
     # successful migration, unmap the device from the source node.
@@ -1009,21 +1071,19 @@ class TLMigrateInstance(Tasklet):
       disks = ExpandCheckDisks(unmap_disks, unmap_disks)
       self.feedback_fn("* unmapping instance's disks %s from %s" %
                        (utils.CommaJoin(d.name for d in unmap_disks),
-                        self.cfg.GetNodeName(self.source_node_uuid)))
+                        self.cfg.GetNodeName(source_node_uuid)))
       for disk in disks:
-        result = self.rpc.call_blockdev_shutdown(self.source_node_uuid,
-                                                 (disk, self.instance))
+        result = self.rpc.call_blockdev_shutdown(source_node_uuid,
+                                                 (disk, instance))
         msg = result.fail_msg
         if msg:
           logging.error("Migration was successful, but couldn't unmap the"
                         " block device %s on source node %s: %s",
                         disk.iv_name,
-                        self.cfg.GetNodeName(self.source_node_uuid), msg)
+                        self.cfg.GetNodeName(source_node_uuid), msg)
           logging.error("You need to unmap the device %s manually on %s",
                         disk.iv_name,
-                        self.cfg.GetNodeName(self.source_node_uuid))
-
-    self.feedback_fn("* done")
+                        self.cfg.GetNodeName(source_node_uuid))
 
   def _ExecFailover(self):
     """Failover an instance.
